@@ -18,7 +18,8 @@ class UserResponse(BaseModel):
     username: str
     is_active: bool
 
-    model_config = {"from_attributes": True}
+    class Config:
+        orm_mode = True
 
 
 class Token(BaseModel):
