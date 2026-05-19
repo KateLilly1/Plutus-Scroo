@@ -1,19 +1,16 @@
 #################################################################################
-## SCROO: a multithreaded, memcached, keygen fixed Plutus fork                 ##
+## SCROO: a multithreaded, keygen fixed Plutus fork                           ##
 ## by Franz Kruhm                                                              ##
 #################################################################################
-## This implements use of memcached to allow sharing of the database between   ##
-## threads. With the current pickled database of 15th march 2021 the RAM use   ##
-## is about 4100gigs for memcached database.                                   ##
-##                                                                             ##
-## The keygen in Plutus has been rewritten as it was returning erroneous       ##
-## addresses.                                                                  ##
+## Standalone version: loads the Bitcoin address database directly into memory ##
+## using a Python set, shared across worker processes via fork copy-on-write.  ##
 ##                                                                             ##
 ## The GPL3 applies.                                                           ##
 ##                                                                             ##
 #################################################################################
 
 import os
+import pickle
 import hashlib
 import binascii
 import codecs
@@ -21,10 +18,24 @@ import ecdsa
 import time
 import multiprocessing
 from datetime import datetime
-from pymemcache.client import base
 
-client = base.Client(('localhost', 11211))
+DATABASE_PATH = 'database/MAR_15_2021/'
 max_processes = int(multiprocessing.cpu_count()/2)
+
+db = None  # populated in __main__ before fork; inherited by workers via COW
+
+
+################################# DATABASE LOAD #################################
+def load_database():
+    addresses = set()
+    files = sorted(os.listdir(DATABASE_PATH))
+    total = len(files)
+    for i, filename in enumerate(files):
+        print('\rLoading database: ' + str(i + 1) + '/' + str(total), end=' ', flush=True)
+        with open(os.path.join(DATABASE_PATH, filename), 'rb') as f:
+            addresses.update(pickle.load(f))
+    print('\nDatabase loaded: ' + '{:,}'.format(len(addresses)) + ' addresses')
+    return addresses
 
 
 ################################# KEYGENERATION #################################
@@ -51,9 +62,9 @@ def keygen(num_keys):
     keys = []
     for i in range(num_keys):
         private = os.urandom(32).hex()
-        
+
         ## PUBLIC UNCOMP
-        public = b'04'+codecs.encode(ecdsa.SigningKey.from_string(codecs.decode(private, 'hex'), curve=ecdsa.SECP256k1).verifying_key.to_string(), 'hex')        
+        public = b'04'+codecs.encode(ecdsa.SigningKey.from_string(codecs.decode(private, 'hex'), curve=ecdsa.SECP256k1).verifying_key.to_string(), 'hex')
         public_key_bytes = codecs.decode(public, 'hex')
 
         ## PUBLIC UNCOMP ADDRESS
@@ -136,39 +147,28 @@ def keygen(num_keys):
 
 ################################# COMPARE CODE #################################
 def process(keys_list):
-    keys_to_call = [];
-    for i in keys_list: 
-        keys_to_call.append(i[3])
-        keys_to_call.append(i[4])
-    keys_ret = client.get_multi(keys_to_call)
-    if keys_ret:
-        with open('plutus.txt', 'a') as file:
-            for i in keys_list:
-                if (i[3] == keys_ret[0] or i[4] == keys_ret[0]):
-                     file.write('hex private key: ' + str(i[0]) + '\n' +
-                      'WIF private key: ' + str(i[1]) + '\n' +
-                      'public key: ' + str(i[2]) + '\n' +
-                      'address uncomp: ' + str(i[3]) + '\n' +
-                      'address comped: ' + str(i[4]) + '\n\n')
+    for i in keys_list:
+        if i[3] in db or i[4] in db:
+            with open('plutus.txt', 'a') as file:
+                file.write('hex private key: ' + str(i[0]) + '\n' +
+                            'WIF private key: ' + str(i[1]) + '\n' +
+                            'public key: ' + str(i[2]) + '\n' +
+                            'address uncomp: ' + str(i[3]) + '\n' +
+                            'address comped: ' + str(i[4]) + '\n\n')
             print(keys_list)
-        print(datetime.now().strftime("%m/%d/%Y, %H:%M:%S"))
-        print('GOT ONE')
+            print(datetime.now().strftime("%m/%d/%Y, %H:%M:%S"))
+            print('GOT ONE')
 
 
 ################################# THREAD CODE #################################
 def main():
     max_sanity_check = int((100000/max_processes)-1)
     sanity_check = max_sanity_check+1
-    #print('max sanity check: ' + str(max_sanity_check))
     while True:
-        keys_t = keygen(max_processes)		
+        keys_t = keygen(max_processes)
         process(keys_t)
         if sanity_check > max_sanity_check:
-            ret_list = client.get_multi(['3PQtD6B1crUVvNHt6fVY5HvdajRrJ6EeGq', '1Ca72914TemMMuDpAscEMeZV3494sztc81'])
-            if ret_list:
-                ##print(datetime.now().strftime("%m/%d/%Y, %H:%M:%S"))
-                ##print('PROC sanity check pass')
-                ret_list = []
+            if '3PQtD6B1crUVvNHt6fVY5HvdajRrJ6EeGq' in db and '1Ca72914TemMMuDpAscEMeZV3494sztc81' in db:
                 sanity_check = 0
             else:
                 print('ERROR: PROC sanity check failed')
@@ -178,17 +178,11 @@ def main():
 
 ################################# ENTRY, DATA LOAD, THREAD START #################################
 if __name__ == '__main__':
+    db = load_database()
     print('available threads: ' + str(max_processes))
-    cpu = 0
-    while cpu < max_processes:
+    for cpu in range(max_processes):
         print('thread spawned: ' + str(cpu))
-        cpu = cpu + 1
         multiprocessing.Process(target=main).start()
     while True:
         time.sleep(15)
-        stats = client.stats()
-        print('\revictions: '+ str(stats.get(b'evictions')) + ' reclaimed: ' + str(stats.get(b'reclaimed')) +
-              ' connections: ' + str(stats.get(b'curr_connections')) + ' misses: ' + str(stats.get(b'get_misses')), end=' ')
-        if stats.get(b'evictions') > 0 or stats.get(b'reclaimed') > 0:
-                     print('!!! ERRORR !!!')
-
+        print('\r' + datetime.now().strftime("%H:%M:%S") + ' workers: ' + str(max_processes), end=' ')
